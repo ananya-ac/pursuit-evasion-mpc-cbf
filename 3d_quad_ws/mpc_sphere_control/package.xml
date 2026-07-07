@@ -4,7 +4,8 @@
   <name>mpc_sphere_control</name>
   <version>0.0.0</version>
   <description>MPC and CBF for 3D navigation</description>
-  <maintainer email="gesemgudino@gmail.com">gesem</maintainer>
+  <maintainer email="gesemgudino@gmail.com">Gesem Mejia</maintainer>
+  <maintainer email="ananya.ds.act@gmail.com">Ananya Acharya</maintainer>
   <license>TODO: License declaration</license>
 
   <depend>rclpy</depend>

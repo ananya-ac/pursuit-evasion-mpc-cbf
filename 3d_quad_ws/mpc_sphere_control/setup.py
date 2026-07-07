@@ -24,8 +24,8 @@ setup(
     ],
     install_requires=['setuptools', 'scipy', 'numpy', 'osqp', 'casadi'],
     zip_safe=True,
-    maintainer='Gesem Mejia',
-    maintainer_email='gesemgudino@gmail.com',
+    maintainer='Gesem Mejia, Ananya Acharya',
+    maintainer_email='gesemgudino@gmail.com, ananya.ds.act@gmail.com',
     description='MPC and CBF for 3D navigation',
     license='TODO: License declaration',
     entry_points={
