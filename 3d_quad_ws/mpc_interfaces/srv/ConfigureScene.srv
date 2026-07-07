@@ -1,0 +1,9 @@
+# Request — sent by PursuitEvasionNode
+int32  num_obs
+string[] robot_ids
+string robot_style         # ENTITY_STYLES key for robot_ids; empty -> 'quadrotor' (default)
+string obstacle_style      # ENTITY_STYLES key for obs_*; empty -> 'evader' (default)
+---
+# Response — sent by RenderNode
+bool success
+string message

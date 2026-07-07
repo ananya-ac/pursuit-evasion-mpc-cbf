@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# ROS2 workspace build artifacts
+build/
+install/
+log/
+
+# OS/editor
+.DS_Store
+.vscode/
+*.swp
