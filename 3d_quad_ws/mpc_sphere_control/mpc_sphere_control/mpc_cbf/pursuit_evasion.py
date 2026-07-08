@@ -32,23 +32,25 @@ class QuadrotorPursuitEvasionSolver:
         horizon,
         radial_weight=1.0,
         radial_cap=100.0,
-        altitude_weight=10.0,
+        cutoff_weight=1.0,
+        cutoff_cap=100.0,
+        altitude_weight=5.0,
         vel_weight=0.05,
-        omega_weight=2.0,
+        omega_weight=10.0,
         pursuer_control_weight=1e-3,
         evader_control_weight=1e-3,
-        pursuer_state_slack_weight=1e3,
-        evader_state_slack_weight=1e3,
+        pursuer_state_slack_weight=1e4,
+        evader_state_slack_weight=1e4,
         omega_slack_weight=1e3,
         workspace_half_extent=12.0,
         workspace_slack_weight=1e3,
         workspace_pull_weight=3.0,
-        z_min=1.0,
+        z_min=0.0,
         omega_xy_max=4.0,
         omega_z_max=3.0,
-        enable_pursuer_pursuer_cbf=False,
-        enable_pursuer_evader_cbf=False,
-        enable_evader_cbf=False,
+        enable_pursuer_pursuer_cbf=True,
+        enable_pursuer_evader_cbf=True,
+        enable_evader_cbf=True,
         D_safe_pursuer=1.5,
         D_safe_pursuer_evader=1.5,
         D_safe_evader=1.5,
@@ -75,6 +77,19 @@ class QuadrotorPursuitEvasionSolver:
         # Caps the radial cost's growth (see _saturating_sumsqr) so it can't dwarf the
         # fixed-scale regularization terms once agents are well-separated.
         self.radial_cap = float(radial_cap)
+        # "Geometric cutoff": penalizes the component of pursuer-evader relative
+        # velocity perpendicular to the current line-of-sight (LOS) — a collision-
+        # course/parallel-navigation intercept term, not just closing distance. The
+        # pursuer minimizing it wants zero transverse drift relative to the LOS
+        # (aim ahead, not tail-chase); the evader maximizing the same term (its
+        # Opti negates J like it does for the radial term) wants to juke sideways
+        # and invalidate that aim point. Off by default (0.0) — opt-in, since it's
+        # an additional shaping term beyond what's been tuned/tested so far.
+        # cutoff_cap saturates it the same way radial_cap does, for the same reason
+        # (an evader-maximized term must stay bounded or it dwarfs regularization).
+        self.w_cutoff    = float(cutoff_weight)
+        self.cutoff_cap  = float(cutoff_cap)
+        self.cutoff_eps  = 1e-6
         # Penalizes deviation from altitude at construction time, so the evader can't
         # "farm" distance by diving under gravity instead of evading horizontally.
         self.altitude_weight = float(altitude_weight)
@@ -165,11 +180,34 @@ class QuadrotorPursuitEvasionSolver:
         for j in range(_NU):
             opti.subject_to(opti.bounded(float(lo[j]), u_vec[j], float(hi[j])))
 
-    def _saturating_sumsqr(self, delta):
-        """Bounded sumsqr(delta), saturating toward radial_cap as ‖delta‖ grows.
-        Evader-only: its IPOPT solve handles the nonlinearity; the pursuer's OSQP
-        solve needs a plain quadratic and doesn't need saturation anyway."""
-        return self.radial_cap * (1 - ca.exp(-ca.sumsqr(delta) / self.radial_cap))
+    def _saturating_sumsqr(self, delta, cap=None):
+        """Bounded sumsqr(delta), saturating toward `cap` (default radial_cap) as
+        ‖delta‖ grows. Evader-only: its IPOPT solve handles the nonlinearity; the
+        pursuer's OSQP solve needs a plain quadratic and doesn't need saturation."""
+        cap = self.radial_cap if cap is None else cap
+        return cap * (1 - ca.exp(-ca.sumsqr(delta) / cap))
+
+    @staticmethod
+    def _frozen_perp_projectors(pursuer_pos_forecasts, evader_pos_forecast, eps=1e-6):
+        """(9*N_p, N+1) flattened LOS-perpendicular projectors P_perp = I - r̂r̂ᵀ,
+        one per pursuer per horizon stage — r̂ is the unit line-of-sight vector
+        from pursuer i to the evader. Computed from FIXED (already-forecasted,
+        not decision-variable) positions so the resulting cutoff cost term stays
+        exactly quadratic in the Opti's decision variables (required for the
+        pursuer's OSQP solve; harmless for the evader's IPOPT solve too)."""
+        N_p = len(pursuer_pos_forecasts)
+        N_plus_1 = evader_pos_forecast.shape[1]
+        P_perp = np.zeros((9 * N_p, N_plus_1))
+        for k in range(N_plus_1):
+            p_e = evader_pos_forecast[:, k]
+            for i in range(N_p):
+                p_i = pursuer_pos_forecasts[i][:, k]
+                los = p_e - p_i
+                los_norm = max(np.linalg.norm(los), eps)
+                r_hat = los / los_norm
+                proj = np.eye(3) - np.outer(r_hat, r_hat)
+                P_perp[9 * i:9 * i + 9, k] = proj.reshape(-1, order="F")
+        return P_perp
 
     def _build_pursuer_solver(self):
         opti = ca.Opti("conic")
@@ -187,6 +225,12 @@ class QuadrotorPursuitEvasionSolver:
         cd_param    = opti.parameter(N_p, nx)
         z_ref_param = opti.parameter(N_p)        # nominal altitude (fixed at construction), per pursuer
         evader_traj = opti.parameter(3, N + 1)   # fixed evader position forecast
+
+        # Geometric-cutoff params — only added to the graph if actually used, so
+        # this is a no-op (byte-for-byte prior behavior) when cutoff_weight <= 0.
+        if self.w_cutoff > 0.0:
+            evader_vel_traj = opti.parameter(3, N + 1)         # fixed evader velocity forecast
+            P_perp_param    = opti.parameter(9 * N_p, N + 1)   # fixed LOS-perp projectors (see _frozen_perp_projectors)
 
         opti.subject_to(X[:, 0] == x0_param)
         opti.subject_to(ca.vec(slack) >= 0)
@@ -216,6 +260,10 @@ class QuadrotorPursuitEvasionSolver:
                 omega_k = X[base_x + 9:base_x + 12, k + 1]
                 self._add_workspace_bounds(opti, pos_k, ws_slack[i, k])
                 J += self.w_radial * ca.sumsqr(pos_k - evader_traj[:, k + 1])
+                if self.w_cutoff > 0.0:
+                    P_perp_ik = ca.reshape(P_perp_param[9 * i:9 * i + 9, k + 1], 3, 3)
+                    v_err_ik  = ca.mtimes(P_perp_ik, vel_k - evader_vel_traj[:, k + 1])
+                    J += self.w_cutoff * ca.sumsqr(v_err_ik)
                 J += self.altitude_weight * ca.sumsqr(pos_k[2] - z_ref_param[i])
                 J += self.workspace_pull_weight * ca.sumsqr(pos_k[0:2] - self.workspace_center[0:2])
                 J += self.vel_weight * ca.sumsqr(vel_k)
@@ -228,13 +276,18 @@ class QuadrotorPursuitEvasionSolver:
         opti.minimize(J)
         opti.solver("osqp", {"verbose": False, "osqp": {"verbose": False}})
 
+        params = {
+            "x0": x0_param, "A": Ad_param, "B": Bd_param, "c": cd_param,
+            "z_ref": z_ref_param, "evader_traj": evader_traj,
+        }
+        if self.w_cutoff > 0.0:
+            params["evader_vel_traj"] = evader_vel_traj
+            params["P_perp"] = P_perp_param
+
         return (
             opti,
             {"X": X, "U": U, "slack": slack, "omega_slack": omega_slack, "ws_slack": ws_slack},
-            {
-                "x0": x0_param, "A": Ad_param, "B": Bd_param, "c": cd_param,
-                "z_ref": z_ref_param, "evader_traj": evader_traj,
-            },
+            params,
         )
 
     def _build_evader_solver(self):
@@ -253,6 +306,10 @@ class QuadrotorPursuitEvasionSolver:
         c_param      = opti.parameter(nx)
         z_ref_param  = opti.parameter(1)                     # nominal altitude (fixed at construction)
         pursuer_traj = opti.parameter(3 * self.N_p, N + 1)   # fixed pursuer position forecasts
+
+        if self.w_cutoff > 0.0:
+            pursuer_vel_traj = opti.parameter(3 * self.N_p, N + 1)   # fixed pursuer velocity forecasts
+            P_perp_param     = opti.parameter(9 * self.N_p, N + 1)   # fixed LOS-perp projectors
 
         opti.subject_to(X[:, 0] == x0_param)
         opti.subject_to(ca.vec(slack) >= 0)
@@ -273,6 +330,11 @@ class QuadrotorPursuitEvasionSolver:
             for i in range(self.N_p):
                 p_i = pursuer_traj[3 * i:3 * i + 3, k + 1]
                 J_radial += self.w_radial * self._saturating_sumsqr(X[0:3, k + 1] - p_i)
+                if self.w_cutoff > 0.0:
+                    v_i = pursuer_vel_traj[3 * i:3 * i + 3, k + 1]
+                    P_perp_ik = ca.reshape(P_perp_param[9 * i:9 * i + 9, k + 1], 3, 3)
+                    v_err_ik  = ca.mtimes(P_perp_ik, v_i - X[3:6, k + 1])
+                    J_radial += self.w_cutoff * self._saturating_sumsqr(v_err_ik, cap=self.cutoff_cap)
 
             # Altitude/workspace-pull terms stay in J_reg (not negated) so the evader
             # can't dive/run to farm distance instead of genuinely evading.
@@ -292,13 +354,18 @@ class QuadrotorPursuitEvasionSolver:
             {"max_iter": 500, "print_level": 0, "sb": "yes"},
         )
 
+        e_params = {
+            "x0": x0_param, "A": A_param, "B": B_param, "c": c_param,
+            "z_ref": z_ref_param, "pursuer_traj": pursuer_traj,
+        }
+        if self.w_cutoff > 0.0:
+            e_params["pursuer_vel_traj"] = pursuer_vel_traj
+            e_params["P_perp"] = P_perp_param
+
         return (
             opti,
             {"X": X, "U": U, "slack": slack, "omega_slack": omega_slack, "ws_slack": ws_slack},
-            {
-                "x0": x0_param, "A": A_param, "B": B_param, "c": c_param,
-                "z_ref": z_ref_param, "pursuer_traj": pursuer_traj,
-            },
+            e_params,
         )
 
     # ── main entry point ────────────────────────────────────────────────────
@@ -336,6 +403,25 @@ class QuadrotorPursuitEvasionSolver:
         U_e_hover = np.tile(self._hover_control(self.evader), self.N)
         X_e_forecast = np.concatenate([x0_e, S_x @ x0_e + S_u @ U_e_hover + S_c]).reshape(self.N + 1, _NX).T
         evader_pos_forecast = X_e_forecast[0:3, :]   # (3, N+1)
+        evader_vel_forecast = X_e_forecast[3:6, :]   # (3, N+1)
+
+        # 2b. Geometric-cutoff projectors for the pursuers' solve: each pursuer's
+        #     own position is the decision variable being solved for, so — same
+        #     idea as the evader forecast above — forecast it under hover control
+        #     from its own already-frozen (A,B,c) instead. Only computed when the
+        #     cutoff term is enabled.
+        if self.w_cutoff > 0.0:
+            pursuer_pos_forecast_pre = []
+            for i in range(self.N_p):
+                Sx_i, Su_i, Sc_i = _condense_linear_horizon(A_p[i], B_p[i], c_p[i], self.N)
+                U_hover_i = np.tile(self._hover_control(self.pursuers[i]), self.N)
+                X_i = np.concatenate(
+                    [x0_p[i], Sx_i @ x0_p[i] + Su_i @ U_hover_i + Sc_i]
+                ).reshape(self.N + 1, _NX).T
+                pursuer_pos_forecast_pre.append(X_i[0:3, :])
+            P_perp_pre = self._frozen_perp_projectors(
+                pursuer_pos_forecast_pre, evader_pos_forecast, self.cutoff_eps
+            )
 
         # 3. Solve pursuers.
         self.pursuer_opti.set_value(self.p_params["x0"], np.concatenate(x0_p))
@@ -348,6 +434,9 @@ class QuadrotorPursuitEvasionSolver:
         self.pursuer_opti.set_value(self.p_params["c"], np.stack(c_p))
         self.pursuer_opti.set_value(self.p_params["z_ref"], np.array(self.pursuer_nominal_z))
         self.pursuer_opti.set_value(self.p_params["evader_traj"], evader_pos_forecast)
+        if self.w_cutoff > 0.0:
+            self.pursuer_opti.set_value(self.p_params["evader_vel_traj"], evader_vel_forecast)
+            self.pursuer_opti.set_value(self.p_params["P_perp"], P_perp_pre)
         try:
             sol_p = self.pursuer_opti.solve()
         except RuntimeError as exc:
@@ -365,12 +454,28 @@ class QuadrotorPursuitEvasionSolver:
         for i in range(self.N_p):
             pursuer_pos_forecast[3 * i:3 * i + 3, :] = X_p_opt[i * _NX:i * _NX + 3, :]
 
+        # 4b. Geometric-cutoff projectors for the evader's solve — recomputed
+        #     from the pursuers' just-solved (actual, not forecasted) trajectory,
+        #     same asymmetry pursuer_pos_forecast/pursuer_traj above already has.
+        if self.w_cutoff > 0.0:
+            pursuer_vel_forecast = np.zeros((3 * self.N_p, self.N + 1))
+            pursuer_pos_forecast_post = []
+            for i in range(self.N_p):
+                pursuer_vel_forecast[3 * i:3 * i + 3, :] = X_p_opt[i * _NX + 3:i * _NX + 6, :]
+                pursuer_pos_forecast_post.append(X_p_opt[i * _NX:i * _NX + 3, :])
+            P_perp_post = self._frozen_perp_projectors(
+                pursuer_pos_forecast_post, evader_pos_forecast, self.cutoff_eps
+            )
+
         # 5. Solve evader.
         self.evader_opti.set_value(self.e_params["x0"], x0_e)
         self.evader_opti.set_value(self.e_params["A"], A_e)
         self.evader_opti.set_value(self.e_params["B"], B_e)
         self.evader_opti.set_value(self.e_params["c"], c_e)
         self.evader_opti.set_value(self.e_params["z_ref"], self.evader_nominal_z)
+        if self.w_cutoff > 0.0:
+            self.evader_opti.set_value(self.e_params["pursuer_vel_traj"], pursuer_vel_forecast)
+            self.evader_opti.set_value(self.e_params["P_perp"], P_perp_post)
         self.evader_opti.set_value(self.e_params["pursuer_traj"], pursuer_pos_forecast)
         try:
             sol_e = self.evader_opti.solve()

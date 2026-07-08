@@ -16,13 +16,19 @@ Parameters (--ros-args -p key:=value):
   enable_evader_cbf          : bool  (default: true)
   playback_rate              : float (default: 1.0)  — scales only the wall-clock
                                 timer period, not the physics/MPC timestep.
-  encirclement_radius        : float (default: 8.0)  — pursuers spawn scattered
+  encirclement_radius        : float (default: 22.0) — pursuers spawn scattered
                                 within +-30% radius / +-30 deg elevation of this.
   d_safe_pursuer_evader       : float (default: 0.75) — braking-CBF safety margin.
   capture_radius              : float (default: 1.5)  — game-termination distance;
                                 must be > d_safe_pursuer_evader.
-  workspace_half_extent       : float (default: 12.0) — soft RViz framing box;
+  workspace_half_extent       : float (default: 32.0) — soft RViz framing box;
                                 must be > 1.3 * encirclement_radius.
+  cutoff_weight               : float (default: 0.0)  — weight on the "geometric
+                                cutoff" term (penalizes pursuer-evader relative
+                                velocity transverse to the line-of-sight, a
+                                collision-course/parallel-navigation intercept
+                                cue rather than pure tail-chase). 0.0 disables it
+                                (byte-identical to before this was added).
 
 Snapshots: record a rosbag (e.g. `ros2 bag record -a`) and play it back through
 RViz, pausing at the init/middle/capture timestamps logged below.
@@ -57,15 +63,16 @@ class PursuitEvasionNode(Node):
 
         # ── Parameters ──────────────────────────────────────────────────────
         self.declare_parameter('num_pursuers', 1)
-        self.declare_parameter('horizon', 6)
+        self.declare_parameter('horizon', 30)
         self.declare_parameter('enable_pursuer_evader_cbf', True)
         self.declare_parameter('enable_pursuer_pursuer_cbf', True)
         self.declare_parameter('enable_evader_cbf', True)
         self.declare_parameter('playback_rate', 1.0)
-        self.declare_parameter('encirclement_radius', 8.0)
+        self.declare_parameter('encirclement_radius', 22.0)
         self.declare_parameter('d_safe_pursuer_evader', 0.5)
         self.declare_parameter('capture_radius', 2.3)
-        self.declare_parameter('workspace_half_extent', 12.0)
+        self.declare_parameter('workspace_half_extent', 32.0)
+        self.declare_parameter('cutoff_weight', 1.0)
 
         self.num_pursuers = int(self.get_parameter('num_pursuers').value)
         self.horizon       = int(self.get_parameter('horizon').value)
@@ -77,6 +84,7 @@ class PursuitEvasionNode(Node):
         self.d_safe_pursuer_evader = float(self.get_parameter('d_safe_pursuer_evader').value)
         self.capture_radius        = float(self.get_parameter('capture_radius').value)
         self.workspace_half_extent = float(self.get_parameter('workspace_half_extent').value)
+        self.cutoff_weight        = float(self.get_parameter('cutoff_weight').value)
 
         if self.playback_rate <= 0.0:
             raise ValueError(f"playback_rate must be > 0, got {self.playback_rate!r}")
@@ -101,7 +109,7 @@ class PursuitEvasionNode(Node):
 
         # ── Scene: evader in the center, N_p pursuers scattered around it ───
         params = QuadrotorParams()
-        evader_start = [8.0, 8.0, 5.0]
+        evader_start = [8.0, 8.0, 12.0]
         self.evader  = Quadrotor('evader_0', evader_start, self.dt, params=params)
 
         self.pursuer_ids = [f'pursuer_{i}' for i in range(self.num_pursuers)]
@@ -116,7 +124,7 @@ class PursuitEvasionNode(Node):
             start_positions.append([
                 evader_start[0] + radius * np.cos(elevation) * np.cos(azimuth),
                 evader_start[1] + radius * np.cos(elevation) * np.sin(azimuth),
-                evader_start[2] + radius * np.sin(elevation),
+                max(10.0, evader_start[2] + radius * np.sin(elevation)),
             ])
         self.pursuers = [
             Quadrotor(pid, pos, self.dt, params=params)
@@ -130,6 +138,7 @@ class PursuitEvasionNode(Node):
             enable_evader_cbf=self.enable_ec,
             D_safe_pursuer_evader=self.d_safe_pursuer_evader,
             workspace_half_extent=self.workspace_half_extent,
+            cutoff_weight=self.cutoff_weight,
         )
 
         # Capture-radius sphere: precomputed once as local offsets (Fibonacci/golden-spiral
